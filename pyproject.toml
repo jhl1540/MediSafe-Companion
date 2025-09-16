@@ -1,0 +1,2 @@
+[tool.langserve]
+graphs."medical-agent" = "medical_agent:app"
