@@ -368,3 +368,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python ddinter_scrape_selenium_only.py --drug-id DDInter263 --out caffeine_ddis.csv
