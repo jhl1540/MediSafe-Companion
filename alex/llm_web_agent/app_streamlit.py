@@ -98,7 +98,7 @@ Markdown으로 정리하고, 마지막엔 📚출처도 반드시 알려줘.
                     drug1_info = parts[0].strip()
                     rest = parts[1].split("### 💥 두 약물의 상호작용")
                     drug2_info = rest[0].strip()
-                    interaction_info = "### 💥 두 약물의 상호작용" + rest[1].strip()
+                    interaction_info = "### 💥 두 약물의 상호작용\n\n" + rest[1].strip()
 
                     col1, col2 = st.columns([1, 1])
                     with col1:
