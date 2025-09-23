@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8123,
+    "reload": true
+  },
+  "dependencies": [
+    "langgraph>=0.2.0",
+    "pydantic>=2",
+    "neo4j>=5",
+    "requests>=2",
+    "beautifulsoup4>=4.12",
+    "python-dotenv>=1",
+    "gradio>=4"
+  ],
+  "graphs": {
+    "ddi-rag": "langgraph_pipeline:app"
+  }
+}

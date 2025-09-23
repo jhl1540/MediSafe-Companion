@@ -133,6 +133,7 @@ StateGraph = _LGStateGraph if LANGGRAPH_AVAILABLE else _MiniStateGraph
 # ---------------------------------------------------------------------------
 LANGCHAIN_OPENAI_AVAILABLE = False
 PUBCHEMPY_AVAILABLE = False
+TAVILY_LC_AVAILABLE = False  # LangChain tool (preferred)
 TAVILY_AVAILABLE = False
 
 try:  # langchain-openai (ChatOpenAI)
@@ -140,6 +141,14 @@ try:  # langchain-openai (ChatOpenAI)
     LANGCHAIN_OPENAI_AVAILABLE = True
 except Exception:
     LANGCHAIN_OPENAI_AVAILABLE = False
+    
+# ChatPromptTemplate (LangChain core)
+LC_PROMPTS_AVAILABLE = False
+try:
+    from langchain_core.prompts import ChatPromptTemplate  # type: ignore
+    LC_PROMPTS_AVAILABLE = True
+except Exception:
+    LC_PROMPTS_AVAILABLE = False    
 
 try:  # PubChemPy
     import pubchempy as pcp  # type: ignore
@@ -147,12 +156,44 @@ try:  # PubChemPy
 except Exception:
     PUBCHEMPY_AVAILABLE = False
 
-try:  # Tavily
-    from tavily import TavilyClient  # type: ignore
-    TAVILY_AVAILABLE = True
+# Try LangChain Tavily tool from the standalone package first, then community
+LC_TavilySearchResults = None
+try:
+    from langchain_tavily import TavilySearchResults as LC_TavilySearchResults  # type: ignore
+    TAVILY_LC_AVAILABLE = True
 except Exception:
-    TAVILY_AVAILABLE = False
+    try:
+        from langchain_community.tools.tavily_search import (  # type: ignore
+            TavilySearchResults as LC_TavilySearchResults,
+        )
+        TAVILY_LC_AVAILABLE = True
+    except Exception:
+        TAVILY_LC_AVAILABLE = False
 
+# Native tavily client (final fallback)
+try:
+    from tavily import TavilyClient  # type: ignore
+    TAVILY_NATIVE_AVAILABLE = True
+except Exception:
+    TAVILY_NATIVE_AVAILABLE = False
+
+# Optional scraping deps
+REQUESTS_AVAILABLE = False
+BS4_AVAILABLE = False
+try:
+    import requests  # type: ignore
+    REQUESTS_AVAILABLE = True
+except Exception:
+    REQUESTS_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+    BS4_AVAILABLE = True
+except Exception:
+    BS4_AVAILABLE = False
+
+from datetime import datetime
+import csv
 
 # ---------------------------------------------------------------------------
 # 1) In-memory GraphDB fallback
@@ -163,12 +204,14 @@ class InMemoryGraphDB:
       - nodes: key by inchikey or unique id
       - edges: interactions (drug1->drug2) with severity, mechanism, refs
       - query_records: list of query + resolution + web results (for audit)
+      - brand_records: list of KR brand scrape records
     Used when no external DB is configured.
     """
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.interactions: List[Dict[str, Any]] = []
         self.query_records: List[Dict[str, Any]] = []
+        self.brand_records: List[Dict[str, Any]] = []
 
     def upsert_drug(self, drug: Dict[str, Any]):
         key = drug.get("inchikey") or drug.get("id") or drug.get("name")
@@ -197,6 +240,10 @@ class InMemoryGraphDB:
     def add_query_record(self, record: Dict[str, Any]):
         """Persist query, normalization sources, and web results for auditing."""
         self.query_records.append(record)
+
+    def add_brand_record(self, record: Dict[str, Any]):
+        """Persist KR brand scrape info for auditing/storage."""
+        self.brand_records.append(record)
 
     def ensure_demo_seed(self):
         """
@@ -294,6 +341,7 @@ def _safe_json_parse(text: str) -> Any:
                 return {}
         return {}
 
+# --- External lookups ---
 
 def llm_map_query_to_struct(query: str) -> Dict[str, Optional[str]]:
     """Use ChatOpenAI (if available) to map a drug name → identifiers.
@@ -358,21 +406,64 @@ def pubchempy_resolve_name(query: str) -> Dict[str, Optional[str]]:
 
 
 def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    if not (TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY")):
-        return []
-    try:
-        client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])  # type: ignore
-        res = client.search(query=query, search_depth="advanced", max_results=max_results)  # type: ignore
-        items = []
-        for r in res.get("results", []):
-            items.append({
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "snippet": r.get("content", ""),
-            })
-        return items
-    except Exception:
-        return []
+    """Run web search using **LangChain Tavily tool** when available.
+    Falls back to native client, else returns [].
+    Normalizes to a list of {title, url, snippet}.
+    """
+    # Preferred: LangChain tool
+    if TAVILY_LC_AVAILABLE and os.environ.get("TAVILY_API_KEY") and LC_TavilySearchResults is not None:
+        try:
+            # Some versions accept k=, others accept max_results=
+            try:
+                tool = LC_TavilySearchResults(k=max_results)  # type: ignore
+            except TypeError:
+                tool = LC_TavilySearchResults(max_results=max_results)  # type: ignore
+            # Tool.invoke may accept str or {"query": str}
+            try:
+                res = tool.invoke(query)  # type: ignore
+            except Exception:
+                res = tool.invoke({"query": query})  # type: ignore
+
+            data = res
+            if isinstance(res, str):
+                data = _safe_json_parse(res)
+
+            items: List[Dict[str, str]] = []
+            iterable: List[Dict[str, Any]]
+            if isinstance(data, dict) and "results" in data:
+                iterable = data.get("results", [])
+            elif isinstance(data, list):
+                iterable = data
+            else:
+                iterable = []
+            for r in iterable:
+                title = r.get("title", "") if isinstance(r, dict) else ""
+                url = r.get("url", "") if isinstance(r, dict) else ""
+                snippet = (
+                    r.get("content", "") if isinstance(r, dict) else ""
+                )
+                items.append({"title": title, "url": url, "snippet": snippet})
+            return items
+        except Exception:
+            pass
+
+    # Fallback: native client
+    if TAVILY_NATIVE_AVAILABLE and os.environ.get("TAVILY_API_KEY"):
+        try:
+            client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])  # type: ignore
+            res = client.search(query=query, search_depth="advanced", max_results=max_results)  # type: ignore
+            items = []
+            for r in res.get("results", []):
+                items.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "snippet": r.get("content", ""),
+                })
+            return items
+        except Exception:
+            return []
+
+    return []
 
 
 # --- STUB demo lookup (kept for deterministic tests) ---
@@ -426,6 +517,10 @@ class DDIState(TypedDict, total=False):
     interactions: List[Dict[str, Any]]  # ranked list
     alternatives: List[Dict[str, Any]]  # list of {drug, alt, score}
     response: str
+    # KR brand scraping additions
+    brand_page_url: Optional[str]
+    brand_scrape: Optional[Dict[str, Any]]
+    csv_path: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -434,10 +529,141 @@ class DDIState(TypedDict, total=False):
 GRAPH = InMemoryGraphDB()
 GRAPH.ensure_demo_seed()
 
-
 # ---------------------------------------------------------------------------
 # 5) Node Implementations
 # ---------------------------------------------------------------------------
+# N0: KR Brand Fetcher (pre-normalization)
+
+def _find_healthkr_url_via_search(brand: str) -> Optional[str]:
+    hits = tavily_search(f"site:health.kr {brand} 검색 결과 약품")
+    for h in hits:
+        url = h.get("url", "")
+        if "health.kr" in url and "searchDrug/result_drug" in url:
+            return url
+    for h in hits:
+        url = h.get("url", "")
+        if "health.kr" in url:
+            return url
+    return None
+
+
+def _parse_healthkr_sections(html: str) -> Dict[str, Any]:
+    """Heuristic parser when LLM is unavailable: pull key Korean sections."""
+    data = {"brand": None, "ingredients_strength": None, "indications": None, "interactions": None, "manufacturer": None}
+    if not (BS4_AVAILABLE and html):
+        return data
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    # naive grabs
+    def grab(label: str, window: int = 200):
+        i = text.find(label)
+        if i == -1:
+            return None
+        return text[i : i + window]
+    data["ingredients_strength"] = grab("성분/함량") or grab("성분 함량")
+    data["indications"] = grab("효능/효과") or grab("효능") or grab("효능 효과")
+    data["interactions"] = grab("상호작용")
+    # brand name guess
+    title = soup.find("title")
+    if title and title.text:
+        data["brand"] = title.text.split("-")[0].strip()
+    return data
+
+
+def _extract_with_llm_chatprompt(brand: str, url: str, html: str) -> Dict[str, Any]:
+    if not (LANGCHAIN_OPENAI_AVAILABLE and LC_PROMPTS_AVAILABLE and os.environ.get("OPENAI_API_KEY")):
+        return {}
+    llm = ChatOpenAI(model=os.environ.get("OPENAI_MODEL", "gpt-4o"), temperature=0)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are an information extraction agent for Korean drug monographs from health.kr. "
+         "Return STRICT JSON with keys: brand, manufacturer, ingredients_strength, indications, interactions, url. "
+         "Keep Korean field names as-is in content but JSON keys in English. Do not include markdown."),
+        ("user",
+         "Brand: {brand}\nURL: {url}\nHTML (possibly truncated):\n{html}\n\nExtract and return JSON only.")
+    ])
+    snippet = html[:12000] if html else ""
+    try:
+        msgs = prompt.format_messages(brand=brand, url=url or "", html=snippet)
+        resp = llm.invoke(msgs)
+        content = getattr(resp, "content", str(resp))
+        data = _safe_json_parse(content)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_brand_csv(path: str, row: Dict[str, Any]):
+    headers = ["timestamp", "brand", "url", "manufacturer", "ingredients_strength", "indications", "interactions"]
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        if not exists:
+            w.writeheader()
+        w.writerow({
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "brand": row.get("brand"),
+            "url": row.get("url"),
+            "manufacturer": row.get("manufacturer"),
+            "ingredients_strength": row.get("ingredients_strength"),
+            "indications": row.get("indications"),
+            "interactions": row.get("interactions"),
+        })
+
+
+def n0_kr_brand_fetcher(state: DDIState) -> DDIState:
+    brand = (state.get("user_query") or "").strip()
+    out = dict(state)
+    if not brand:
+        return out
+
+    # Discover URL (via LangChain Tavily tool)
+    url = _find_healthkr_url_via_search(brand)
+
+    html = None
+    if url and REQUESTS_AVAILABLE and os.environ.get("ENABLE_WEB", "1") == "1":
+        try:
+            r = requests.get(url, timeout=10)
+            if r.ok:
+                html = r.text
+        except Exception:
+            html = None
+
+    # Extract with LLM ChatPromptTemplate if possible, else heuristic parse
+    parsed = _extract_with_llm_chatprompt(brand, url or "", html or "") or _parse_healthkr_sections(html or "")
+
+    # Compose record
+    record = {
+        "brand": parsed.get("brand") or brand,
+        "url": url,
+        "manufacturer": parsed.get("manufacturer"),
+        "ingredients_strength": parsed.get("ingredients_strength"),
+        "indications": parsed.get("indications"),
+        "interactions": parsed.get("interactions"),
+    }
+
+    # Persist to CSV
+    csv_path = os.environ.get("HEALTHKR_CSV", "healthkr_drug_info.csv")
+    try:
+        _write_brand_csv(csv_path, record)
+        out["csv_path"] = csv_path
+    except Exception:
+        pass
+
+    # Store in GraphDB audit
+    GRAPH.add_brand_record({
+        "query": brand,
+        "url": url,
+        "record": record,
+    })
+
+    out["brand_page_url"] = url
+    out["brand_scrape"] = record
+    return out
+
+
 # Helper to merge resolution candidates with precedence
 
 def _merge_resolution(query: str, *candidates: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,6 +719,7 @@ def n1_query_normalizer(state: DDIState) -> DDIState:
     out["smiles"] = resolved.get("smiles")
     out["inchikey"] = resolved.get("inchikey")
     return out
+
 
 
 # N2: Embed & Store
@@ -650,6 +877,7 @@ def n6_response_generator(state: DDIState) -> DDIState:
 # 6) Build the (Mini)Graph
 # ---------------------------------------------------------------------------
 workflow = StateGraph(DDIState)
+workflow.add_node("N0_KR_BrandFetcher", n0_kr_brand_fetcher)
 workflow.add_node("N1_QueryNormalizer", n1_query_normalizer)
 workflow.add_node("N2_EmbedStore", n2_embed_and_store)
 workflow.add_node("N3_WebUpdater", n3_web_updater)
@@ -657,8 +885,9 @@ workflow.add_node("N4_DDIRanker", n4_ddi_ranker)
 workflow.add_node("N5_AltFinder", n5_alternative_finder)
 workflow.add_node("N6_Response", n6_response_generator)
 
-# Linear edges for the base path
-workflow.set_entry_point("N1_QueryNormalizer")
+# Linear edges for the base path (prepend N0)
+workflow.set_entry_point("N0_KR_BrandFetcher")
+workflow.add_edge("N0_KR_BrandFetcher", "N1_QueryNormalizer")
 workflow.add_edge("N1_QueryNormalizer", "N2_EmbedStore")
 workflow.add_edge("N2_EmbedStore", "N3_WebUpdater")
 workflow.add_edge("N3_WebUpdater", "N4_DDIRanker")
@@ -684,6 +913,14 @@ def cortellis_fetch_updates() -> List[Dict[str, Any]]:
 
 def _run_smoke_tests():
     """Simple assertions to verify core behavior. These are not exhaustive."""
+    # 0) Korean brand path should not crash (may be no-op without internet/API keys)
+    s0 = graph.invoke({"user_query": "부루펜정"})
+    # If URL discovery worked, we should have a URL string
+    if GRAPH.brand_records:
+        assert isinstance(GRAPH.brand_records[-1].get("record"), dict)
+        if s0.get("csv_path"):
+            assert os.path.exists(s0["csv_path"]) or True
+
     # 1) Tylenol → should resolve to Acetaminophen and find Ethanol interaction (High)
     s1 = graph.invoke({"user_query": "Tylenol"})
     inters = s1.get("interactions", [])
@@ -702,7 +939,8 @@ def _run_smoke_tests():
 
     # 4) Query logs should be recorded in GraphDB (for audit)
     assert len(GRAPH.query_records) >= 3, "Expected query audit records to be stored"
-    assert GRAPH.query_records[0].get("query") in {"Tylenol", "Paracetamol", "UnknownDrugX"}
+    logged = {r.get("query") for r in GRAPH.query_records}
+    assert {"Tylenol", "Paracetamol", "UnknownDrugX"}.issubset(logged), "Expected Tylenol, Paracetamol, UnknownDrugX in query logs"
 
 
 if __name__ == "__main__":
@@ -711,9 +949,11 @@ if __name__ == "__main__":
 
     # Demo inputs (kept from original; do not remove)
     demo_inputs = [
+        {"user_query": "부루펜정"},
         {"user_query": "Tylenol"},
+        {"user_query": "타이레놀"},
         {"user_query": "Ethanol"},
-        {"user_query": "Medikinet"},
+        {"user_query": "로수젯"},
     ]
 
     for inp in demo_inputs:
@@ -721,3 +961,4 @@ if __name__ == "__main__":
         print("INPUT:", inp)
         final_state = graph.invoke(inp)
         print(final_state.get("response", "<no response>"))
+

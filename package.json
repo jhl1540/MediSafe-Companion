@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@langchain/langgraph-cli": "^0.0.66"
+  }
+}
