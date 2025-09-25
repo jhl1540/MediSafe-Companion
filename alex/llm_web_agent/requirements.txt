@@ -3,3 +3,7 @@ openai
 langchain
 langgraph
 python-dotenv
+pandas
+rapidfuzz
+langchain-community
+langchain-openai
