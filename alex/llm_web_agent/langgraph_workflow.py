@@ -1,65 +1,109 @@
-import os
-from dotenv import load_dotenv
+# langgraph_workflow.py
+from typing import Dict, Any
+from langgraph.graph import StateGraph
+from langgraph.constants import START, END
 
-# 최신 경로/타입
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# LangGraph 시작점 분기(START) 사용
-from langgraph.graph import StateGraph, START, END
-
-from prompt_templates import single_drug_prompt, interaction_prompt
-
-# 🔐 환경 변수 로드
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-
-# 💬 LLM 인스턴스
-llm = ChatOpenAI(
-    api_key=api_key,   # openai_api_key=... 대신 최신 키워드
-    model="gpt-4o",
-    temperature=0.5
+from prompt_templates import (
+    single_drug_system, single_drug_user,
+    interaction_system, interaction_user
 )
 
-# 🧠 약사 역할
-system_msg = SystemMessage(content="너는 약물 정보와 상호작용을 전문가처럼 설명하는 약사야.")
+# ─────────────────────────────────────────────────────────────────────────────
+# Nodes
+# ─────────────────────────────────────────────────────────────────────────────
+def analyze_single(state: Dict[str, Any]) -> Dict[str, Any]:
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    msgs = [
+        SystemMessage(content=single_drug_system),
+        HumanMessage(content=single_drug_user.format(drug=state["drug1"]))
+    ]
+    return {"result": llm.invoke(msgs).content}
 
-# 🌐 상태머신 노드
-def analyze_single_drug(state: dict):
-    drug = state["drug1"]
-    prompt_text = single_drug_prompt.format(drug=drug)
-    messages = [system_msg, HumanMessage(content=prompt_text)]
-    response = llm.invoke(messages)
-    return {"result": response.content}
+def analyze_interaction(state: Dict[str, Any]) -> Dict[str, Any]:
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    msgs = [
+        SystemMessage(content=interaction_system),
+        HumanMessage(content=interaction_user.format(
+            drug1=state["drug1"], drug2=state.get("drug2", "")
+        ))
+    ]
+    return {"result": llm.invoke(msgs).content}
 
-def analyze_two_drugs(state: dict):
-    drug1 = state["drug1"]
-    drug2 = state["drug2"]
-    prompt_text = interaction_prompt.format(drug1=drug1, drug2=drug2)
-    messages = [system_msg, HumanMessage(content=prompt_text)]
-    response = llm.invoke(messages)
-    return {"result": response.content}
+# Router: decide next node name ("single" | "pair")
+def route(state: Dict[str, Any]) -> str:
+    return "pair" if state.get("drug2") else "single"
 
-# 🔄 그래프 구축
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph builder (Option A)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_graph():
-    workflow = StateGraph(dict)
+    sg = StateGraph(dict)
 
-    workflow.add_node("analyze_single", analyze_single_drug)
-    workflow.add_node("analyze_interaction", analyze_two_drugs)
+    # register nodes
+    sg.add_node("single", analyze_single)
+    sg.add_node("pair",   analyze_interaction)
 
-    def should_use_interaction(state: dict):
-        return "drug2" in state and state["drug2"] not in ("", None)
-
-    workflow.add_conditional_edges(
+    # START → conditional route → target node
+    sg.add_conditional_edges(
         START,
-        should_use_interaction,
+        route,
         {
-            True: "analyze_interaction",
-            False: "analyze_single"
-        }
+            "single": "single",
+            "pair":   "pair",
+        },
     )
 
-    workflow.add_edge("analyze_single", END)
-    workflow.add_edge("analyze_interaction", END)
+    # terminal edges
+    sg.add_edge("single", END)
+    sg.add_edge("pair",   END)
 
-    return workflow.compile()
+    return sg.compile()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Simple chunk indexer used by the "인덱스(텍스트)" 탭
+# ─────────────────────────────────────────────────────────────────────────────
+def index_text_chunk(state: Dict[str, Any]):
+    """
+    Simplified: create (Document)-[:HAS_CHUNK]->(Chunk) and link (Chunk)-[:MENTIONS]->(Drug)
+    by naive token match against Drug.display_name (lowercased exact).
+    """
+    from neo4j_store import GraphStore
+
+    text = state["text"]
+    store = GraphStore()
+    store.ensure_schema()
+
+    # naive tokenization for demo purposes
+    candidates = list({w.strip(".,;()[]") for w in text.split() if len(w) >= 3})
+
+    cy = """
+    MERGE (doc:Document {doc_id:$doc_id})
+      ON CREATE SET doc.title=$title, doc.source_url=$source_url, doc.createdAt=datetime()
+    MERGE (c:Chunk {chunk_id:$chunk_id})
+      ON CREATE SET c.text=$text
+    MERGE (doc)-[:HAS_CHUNK]->(c)
+    WITH c, $cands AS cands
+    UNWIND cands AS nm
+    WITH c, toLower(nm) AS nm
+    MATCH (d:Drug)
+    WHERE d.name = nm OR toLower(d.display_name) = nm
+    MERGE (c)-[:MENTIONS]->(d)
+    RETURN count(*) AS linked
+    """
+
+    with store._driver.session(database=store._database) as s:
+        s.run(
+            cy,
+            doc_id=state["doc_id"],
+            chunk_id=state["chunk_id"],
+            text=text,
+            title=state.get("title"),
+            source_url=state.get("source_url"),
+            cands=candidates
+        ).consume()
+
+    store.close()
+    return {"chunk_id": state["chunk_id"], "mentions_linked": True}
